@@ -14,7 +14,7 @@ def main():
         raise SystemExit('This overlay requires Windows 10/11.')
     try:
         from PySide6.QtCore import Qt, QTimer, QRectF, QAbstractNativeEventFilter
-        from PySide6.QtGui import QColor, QPainter, QPen, QFont, QPainterPath
+        from PySide6.QtGui import QColor, QPainter, QPen, QFont, QPainterPath, QLinearGradient
         from PySide6.QtWidgets import QApplication, QWidget
     except ImportError:
         ctypes.windll.user32.MessageBoxW(None,
@@ -111,6 +111,44 @@ def main():
                     R.uniform(-10, 10), R.uniform(-14, 5),
                     str(R.randint(1, 24)) if numbered else ''])
 
+    class EdgeCurrent:
+        """One jagged packet running clockwise or counterclockwise around the bezel."""
+        def __init__(self, width, height):
+            self.w, self.h = width, height
+            self.perimeter = 2 * (width + height)
+            self.position = R.uniform(0, self.perimeter)
+            self.speed = R.choice((-1, 1)) * R.uniform(450, 2200)
+            self.length = R.uniform(65, 290)
+            self.offset = R.uniform(-4, 8)
+            self.hue = R.uniform(.48, .64)
+            self.age = 0
+            self.life = R.uniform(.45, 2.4)
+            self.reshape = 0
+            self.noise = [R.uniform(-5, 5) for _ in range(35)]
+
+        def step(self, dt):
+            self.age += dt
+            self.position = (self.position + self.speed * dt) % self.perimeter
+            self.reshape -= dt
+            if self.reshape <= 0:
+                self.reshape = R.uniform(.035, .10)
+                self.noise = [R.uniform(-5, 5) for _ in range(35)]
+                self.speed *= R.uniform(.88, 1.12)
+                self.speed = math.copysign(min(2800, max(300, abs(self.speed))), self.speed)
+
+        def point(self, distance, inset):
+            # Negative insets place parts outside the monitor; clipping is intentional.
+            d = distance % self.perimeter
+            if d < self.w:
+                return d, inset
+            d -= self.w
+            if d < self.h:
+                return self.w-inset, d
+            d -= self.h
+            if d < self.w:
+                return self.w-d, self.h-inset
+            return inset, self.h-(d-self.w)
+
     # Each monitor gets its own frameless, always-on-top, click-through surface.
     class Overlay(QWidget):
         def __init__(self, screen):
@@ -127,6 +165,16 @@ def main():
             self.bubbles = []
             # CUSTOMIZE ACTIVITY: range(4) means four independent trails per monitor.
             self.trails = [Trail(self.width(), self.height()) for _ in range(4)]
+            # CUSTOMIZE ELECTRICITY: 1-10 packets per monitor, refreshed at random times.
+            self.currents = [EdgeCurrent(self.width(), self.height())
+                             for _ in range(R.randint(1, 10))]
+            self.current_change = time.perf_counter() + R.uniform(.4, 2.5)
+            # CUSTOMIZE GLASS: start-to-start intervals are uniformly 30-300 seconds.
+            # Flash alpha remains low; random blink gaps are never a fixed strobe.
+            self.next_flash = time.perf_counter() + R.uniform(30, 300)
+            self.flash_start = None
+            self.flash_schedule = []
+            self.flash_duration = 0
             self.last = time.perf_counter()
             self.timer = QTimer(self)
             self.timer.setTimerType(Qt.TimerType.PreciseTimer)
@@ -151,6 +199,31 @@ def main():
             self.bubbles = live
             for trail in self.trails:
                 trail.step(dt, self.bubbles)
+            for current in self.currents:
+                current.step(dt)
+            if now >= self.current_change:
+                target = R.randint(1, 10)
+                self.currents = self.currents[:target]
+                while len(self.currents) < target:
+                    self.currents.append(EdgeCurrent(self.width(), self.height()))
+                self.current_change = now + R.uniform(.4, 2.5)
+            self.currents = [EdgeCurrent(self.width(), self.height())
+                             if c.age >= c.life else c for c in self.currents]
+            if now >= self.next_flash:
+                self.flash_start = now
+                self.next_flash = now + R.uniform(30, 300)
+                self.flash_schedule = []
+                cursor = 0
+                for _ in range(R.randint(2, 5)):
+                    duration = R.uniform(.35, .65)
+                    self.flash_schedule.append((cursor, cursor+duration, R.uniform(.10, .15)))
+                    cursor += duration + R.uniform(.35, .80)
+                # The last blink becomes a longer glass afterglow, then fades to clear.
+                start, end, alpha = self.flash_schedule[-1]
+                self.flash_schedule[-1] = (start, end+2.4, alpha)
+                self.flash_duration = end+2.4
+            if self.flash_start is not None and now-self.flash_start > self.flash_duration:
+                self.flash_start = None
             self.update()
 
         def draw_guides(self, p):
@@ -200,6 +273,71 @@ def main():
                 p.drawLine(34, 38, 34, 43)
                 p.restore()
 
+        def draw_electricity(self, p):
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            for current in self.currents:
+                fade = min(1, current.age/.06, (current.life-current.age)/.15)
+                direction = 1 if current.speed > 0 else -1
+                path = QPainterPath()
+                for i in range(35):
+                    x, y = current.point(current.position-direction*current.length*i/34,
+                                         current.offset+current.noise[i])
+                    if i == 0:
+                        path.moveTo(x, y)
+                    else:
+                        path.lineTo(x, y)
+                # CUSTOMIZE GLOW: three translucent strokes, never a solid edge panel.
+                for width, alpha, saturation in ((12, .07, .9), (4, .30, .7), (1.1, .78, .15)):
+                    p.setPen(QPen(QColor.fromHsvF(current.hue, saturation, 1,
+                                                 max(0, alpha*fade)), width))
+                    p.drawPath(path)
+
+        def draw_glass(self, p):
+            if self.flash_start is None:
+                return
+            elapsed = time.perf_counter()-self.flash_start
+            strength = 0
+            for i, (start, end, alpha) in enumerate(self.flash_schedule):
+                if start <= elapsed < end:
+                    # Each blink appears abruptly. Last blink fades smoothly to nothing.
+                    strength = alpha
+                    if i == len(self.flash_schedule)-1:
+                        strength *= min(1, max(0, (end-elapsed)/1.8))
+                    break
+            if strength <= 0:
+                return
+            gradient = QLinearGradient(0, 0, self.width(), self.height())
+            gradient.setColorAt(0, QColor.fromRgbF(.2, .85, 1, strength))
+            gradient.setColorAt(.5, QColor.fromRgbF(.7, .65, 1, strength*.55))
+            gradient.setColorAt(1, QColor.fromRgbF(.2, 1, .9, strength))
+            p.fillRect(self.rect(), gradient)
+            # CUSTOMIZE GLASS TEXTURE: fine scanlines, staggered micro-cells,
+            # registration crosses, and a moving diagonal reflection. All are alpha-only.
+            # Stable geometry avoids distracting frame-to-frame noise.
+            w, h = self.width(), self.height()
+            p.setPen(QPen(QColor.fromRgbF(.55, .95, 1, strength*.55), .7))
+            for y in range(0, h, 8):
+                p.drawLine(0, y, w, y)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.setPen(QPen(QColor.fromRgbF(.55, .9, 1, strength*1.05), .9))
+            for row, y in enumerate(range(20, h, 64)):
+                for x in range(20 + (row % 2)*32, w, 64):
+                    p.drawRoundedRect(QRectF(x, y, 19, 11), 2, 2)
+                    p.drawLine(x+24, y+5, x+29, y+5)
+            p.setPen(QPen(QColor.fromRgbF(.7, 1, 1, min(.24, strength*1.5)), 1))
+            for y in range(48, h, 192):
+                for x in range(48, w, 192):
+                    p.drawLine(x-7, y, x+7, y)
+                    p.drawLine(x, y-7, x, y+7)
+                    p.drawEllipse(QRectF(x-12, y-12, 24, 24))
+            # A broad sheen moves slowly across the glass while its texture stays fixed.
+            center = (elapsed / max(.1, self.flash_duration)) * (w+h+500)-250
+            sheen = QLinearGradient(center-200, 0, center+200, 200)
+            sheen.setColorAt(0, QColor(170, 245, 255, 0))
+            sheen.setColorAt(.5, QColor.fromRgbF(.75, .95, 1, strength*.55))
+            sheen.setColorAt(1, QColor(170, 245, 255, 0))
+            p.fillRect(self.rect(), sheen)
+
         def paintEvent(self, event):
             p = QPainter(self)
             p.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -241,6 +379,8 @@ def main():
                                   Qt.PenJoinStyle.RoundJoin))
                     p.setBrush(QColor(255, 255, 255, int(245*fade)))
                     p.drawPath(text)
+            self.draw_electricity(p)
+            self.draw_glass(p)
             # Draw fixed guides last so passing bubbles cannot cover their edges.
             self.draw_guides(p)
             p.end()
